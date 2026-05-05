@@ -1,5 +1,7 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Npgsql;
 using System.CommandLine;
 
 HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
@@ -9,9 +11,16 @@ HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
  * CRUD Service (maybe)
  * Logging extensions 
  */
+
+string connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+    ?? "Host=localhost;Database=postgres;Username=postgres;Password=postgres";
+
 builder.Services.AddTransient<BenchmarkService>();
 builder.Services.AddTransient<SearchService>();
+builder.Services.AddSingleton(NpgsqlDataSource.Create(connectionString));
+
 IHost host = builder.Build();
+
 
 var rootCmd = new RootCommand("Aikel Client");
 
