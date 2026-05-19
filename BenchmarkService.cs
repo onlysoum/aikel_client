@@ -5,20 +5,29 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 
 /// <summary>
-/// Benchmarks pgvector nearest-neighbour search on the bioclinicbert table.
+/// Benchmarks pgvector nearest-neighbour search on the bioclinicbert table
+/// using two indexing strategies: HNSW and IVFFlat.
 ///
-/// Instead of calling an external embedding API (which would skew latency
-/// numbers), we generate random unit vectors of the correct dimension before
-/// the benchmark starts. This isolates pure DB / index performance.
+/// The benchmark runs against each strategy separately and prints a
+/// side-by-side comparison so you can see which index performs better.
+///
+/// HNSW  – Hierarchical Navigable Small World. Fast queries, higher memory.
+/// IVFFlat – Inverted File Index. Lower memory, slightly slower queries.
 /// </summary>
 public class BenchmarkService
 {
     private readonly NpgsqlDataSource _dataSource;
     private readonly BenchmarkConfig  _config;
 
-    // Dimension of the vectors stored in the bioclinicbert table.
-    // BioClinicalBERT produces 768-dimensional embeddings.
+    // Dimension of BioClinicalBERT embeddings.
     private const int VectorDimension = 768;
+
+    // The two index types we benchmark against.
+    private static readonly (string Label, string IndexType)[] IndexStrategies =
+    [
+        ("HNSW",    "hnsw"),
+        ("IVFFlat", "ivfflat"),
+    ];
 
     // ----------------------------------------------------------------
     // Constructor injection
@@ -38,6 +47,7 @@ public class BenchmarkService
 
     /// <summary>
     /// Entry point called from Program.cs via the CLI "benchmark" command.
+    /// Runs the benchmark for each indexing strategy and prints a comparison.
     /// </summary>
     public async Task RunAsync(int iters)
     {
@@ -45,6 +55,7 @@ public class BenchmarkService
 
         Console.WriteLine("═══════════════════════════════════════════════════════");
         Console.WriteLine("  Aikel Client — Vector Search Benchmark");
+        Console.WriteLine("  Comparing: HNSW vs IVFFlat");
         Console.WriteLine("═══════════════════════════════════════════════════════");
         Console.WriteLine($"  Requests      : {config.TotalRequests}");
         Console.WriteLine($"  Concurrency   : {config.ConcurrencyLevel}");
@@ -52,19 +63,41 @@ public class BenchmarkService
         Console.WriteLine($"  Duration limit: {(config.Duration.HasValue ? config.Duration.Value.ToString() : "none")}");
         Console.WriteLine("═══════════════════════════════════════════════════════\n");
 
-        // Warm up the connection pool.
+        // Warm up the connection pool once before all runs.
         await WarmUpAsync();
 
-        // Pre-generate one random unit vector per query in the pool.
-        // We do this outside the hot loop so allocation doesn't skew timings.
+        // Pre-generate random unit vectors outside the hot loop.
         Console.WriteLine("  Pre-generating query vectors...");
-        var rng        = new Random(42); // fixed seed for reproducibility
+        var rng        = new Random(42);
         var vectorPool = config.QueryPool
                                .Select(_ => GenerateRandomUnitVector(rng, VectorDimension))
                                .ToArray();
         Console.WriteLine("  Vectors ready.\n");
 
-        // ── Main benchmark loop ─────────────────────────────────────
+        // Run benchmark for each index strategy and collect summaries.
+        var summaries = new List<(string Label, BenchmarkSummary Summary)>();
+
+        foreach (var (label, indexType) in IndexStrategies)
+        {
+            Console.WriteLine($"  ── Running benchmark for: {label} ──────────────────");
+            var summary = await RunStrategyAsync(config, vectorPool, label, indexType);
+            summaries.Add((label, summary));
+            Console.WriteLine();
+        }
+
+        // Print side-by-side comparison.
+        PrintComparison(summaries);
+    }
+
+    // ----------------------------------------------------------------
+    // Run the full benchmark loop for one indexing strategy.
+    // ----------------------------------------------------------------
+    private async Task<BenchmarkSummary> RunStrategyAsync(
+        BenchmarkConfig config,
+        Vector[] vectorPool,
+        string label,
+        string indexType)
+    {
         var results   = new ConcurrentBag<QueryResult>();
         var semaphore = new SemaphoreSlim(config.ConcurrencyLevel, config.ConcurrencyLevel);
 
@@ -87,12 +120,12 @@ public class BenchmarkService
             {
                 try
                 {
-                    var result = await ExecuteSingleQueryAsync(vector, cts.Token)
+                    var result = await ExecuteSingleQueryAsync(vector, indexType, cts.Token)
                                      .ConfigureAwait(false);
                     results.Add(result);
 
                     if (results.Count % 10 == 0)
-                        Console.WriteLine($"  Progress: {results.Count}/{config.TotalRequests} completed");
+                        Console.WriteLine($"    [{label}] Progress: {results.Count}/{config.TotalRequests} completed");
                 }
                 finally
                 {
@@ -103,23 +136,41 @@ public class BenchmarkService
 
         await Task.WhenAll(tasks).ConfigureAwait(false);
         totalTimer.Stop();
-        // ── End of benchmark loop ───────────────────────────────────
 
-        var summary = BenchmarkSummary.From(results.ToList(), totalTimer.Elapsed.TotalMilliseconds);
-        PrintSummary(summary);
+        return BenchmarkSummary.From(results.ToList(), totalTimer.Elapsed.TotalMilliseconds);
     }
 
     // ----------------------------------------------------------------
-    // Execute one pgvector cosine-distance search query.
+    // Execute one pgvector search query using the specified index type.
+    //
+    // pgvector uses the index automatically based on the operator:
+    //   <=>  cosine distance  (used by both HNSW and IVFFlat)
+    //
+    // We set the search parameters via SET commands to ensure the
+    // correct index type is used for each run:
+    //   hnsw.ef_search   – controls HNSW search quality/speed tradeoff
+    //   ivfflat.probes   – controls IVFFlat search quality/speed tradeoff
     // ----------------------------------------------------------------
     private async Task<QueryResult> ExecuteSingleQueryAsync(
-        Vector vector, CancellationToken ct)
+        Vector vector, string indexType, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
         try
         {
             await using var conn = await _dataSource.OpenConnectionAsync(ct)
                                                     .ConfigureAwait(false);
+
+            // Set index-specific search parameters.
+            await using (var setCmd = conn.CreateCommand())
+            {
+                setCmd.CommandText = indexType switch
+                {
+                    "hnsw"    => "SET hnsw.ef_search = 64;",
+                    "ivfflat" => "SET ivfflat.probes = 10;",
+                    _         => "SELECT 1;"
+                };
+                await setCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
 
             await using var cmd = conn.CreateCommand();
 
@@ -156,7 +207,6 @@ public class BenchmarkService
 
     // ----------------------------------------------------------------
     // Generate a random unit vector of the given dimension.
-    // Unit vectors are standard inputs for cosine-distance search.
     // ----------------------------------------------------------------
     private static Vector GenerateRandomUnitVector(Random rng, int dimension)
     {
@@ -165,7 +215,7 @@ public class BenchmarkService
 
         for (int i = 0; i < dimension; i++)
         {
-            values[i] = (float)(rng.NextDouble() * 2 - 1); // range [-1, 1]
+            values[i] = (float)(rng.NextDouble() * 2 - 1);
             sumSq += values[i] * values[i];
         }
 
@@ -197,28 +247,48 @@ public class BenchmarkService
     }
 
     // ----------------------------------------------------------------
-    // Console reporter.
+    // Print a side-by-side comparison of all strategies.
     // ----------------------------------------------------------------
-    private static void PrintSummary(BenchmarkSummary s)
+    private static void PrintComparison(List<(string Label, BenchmarkSummary Summary)> results)
     {
-        Console.WriteLine("\n═══════════════════════════════════════════════════════");
-        Console.WriteLine("  BENCHMARK RESULTS");
+        Console.WriteLine("═══════════════════════════════════════════════════════");
+        Console.WriteLine("  BENCHMARK COMPARISON RESULTS");
         Console.WriteLine("═══════════════════════════════════════════════════════");
 
-        Console.WriteLine($"  Total Requests      : {s.TotalRequests}");
-        Console.WriteLine($"  Successful          : {s.SuccessfulRequests}");
-        Console.WriteLine($"  Failed              : {s.FailedRequests}");
+        // Header row.
+        Console.WriteLine($"  {"Metric",-25} {"HNSW",12} {"IVFFlat",12}");
+        Console.WriteLine($"  {new string('-', 25)} {new string('-', 12)} {new string('-', 12)}");
+
+        var h = results.FirstOrDefault(r => r.Label == "HNSW").Summary;
+        var v = results.FirstOrDefault(r => r.Label == "IVFFlat").Summary;
+
+        if (h == null || v == null)
+        {
+            Console.WriteLine("  Could not compare — one or both strategies failed.");
+            return;
+        }
+
+        Console.WriteLine($"  {"Total Requests",-25} {h.TotalRequests,12} {v.TotalRequests,12}");
+        Console.WriteLine($"  {"Successful",-25} {h.SuccessfulRequests,12} {v.SuccessfulRequests,12}");
+        Console.WriteLine($"  {"Failed",-25} {h.FailedRequests,12} {v.FailedRequests,12}");
+        Console.WriteLine();
+        Console.WriteLine($"  {"Total Time (ms)",-25} {h.TotalElapsedMs,12:F1} {v.TotalElapsedMs,12:F1}");
+        Console.WriteLine($"  {"Requests/Second",-25} {h.RequestsPerSecond,12:F2} {v.RequestsPerSecond,12:F2}");
+        Console.WriteLine();
+        Console.WriteLine($"  {"Avg Latency (ms)",-25} {h.AvgLatencyMs,12:F2} {v.AvgLatencyMs,12:F2}");
+        Console.WriteLine($"  {"Min Latency (ms)",-25} {h.MinLatencyMs,12:F2} {v.MinLatencyMs,12:F2}");
+        Console.WriteLine($"  {"Max Latency (ms)",-25} {h.MaxLatencyMs,12:F2} {v.MaxLatencyMs,12:F2}");
+        Console.WriteLine($"  {"p95 Latency (ms)",-25} {h.P95LatencyMs,12:F2} {v.P95LatencyMs,12:F2}");
+        Console.WriteLine($"  {"p99 Latency (ms)",-25} {h.P99LatencyMs,12:F2} {v.P99LatencyMs,12:F2}");
 
         Console.WriteLine();
-        Console.WriteLine($"  Total Time          : {s.TotalElapsedMs:F1} ms  ({s.TotalElapsedMs / 1000.0:F2} s)");
-        Console.WriteLine($"  Requests / Second   : {s.RequestsPerSecond:F2} rps");
 
-        Console.WriteLine();
-        Console.WriteLine($"  Avg Latency         : {s.AvgLatencyMs:F2} ms");
-        Console.WriteLine($"  Min Latency         : {s.MinLatencyMs:F2} ms");
-        Console.WriteLine($"  Max Latency         : {s.MaxLatencyMs:F2} ms");
-        Console.WriteLine($"  p95 Latency         : {s.P95LatencyMs:F2} ms");
-        Console.WriteLine($"  p99 Latency         : {s.P99LatencyMs:F2} ms");
+        // Winner summary.
+        string winner = h.AvgLatencyMs < v.AvgLatencyMs ? "HNSW" : "IVFFlat";
+        Console.WriteLine($"  ✔ Lower avg latency: {winner}");
+
+        string throughputWinner = h.RequestsPerSecond > v.RequestsPerSecond ? "HNSW" : "IVFFlat";
+        Console.WriteLine($"  ✔ Higher throughput: {throughputWinner}");
 
         Console.WriteLine("═══════════════════════════════════════════════════════\n");
     }
